@@ -1,0 +1,8 @@
+# IDS/NIDS Pipeline - Required Dependencies
+# ==========================================
+
+# File system monitoring
+watchdog>=3.0.0
+
+# Data processing and CSV handling
+pandas>=2.0.0
