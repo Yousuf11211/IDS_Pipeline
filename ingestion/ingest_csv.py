@@ -532,11 +532,17 @@ class CSVEventHandler(FileSystemEventHandler):
 
 def start_file_watcher():
     """
-    Start the file watching service.
+    Start the file watching service with queue-based processing.
 
-    This function initializes the watchdog observer to monitor the input_csv
-    directory for new CSV files. It runs continuously until interrupted.
+    This function:
+    1. Starts a queue processor thread that handles files one by one
+    2. Initializes the watchdog observer to monitor input_csv/
+    3. Runs continuously until interrupted (Ctrl+C)
+
+    Files are processed in FIFO order (First In, First Out).
     """
+    global queue_processor_running
+
     # Ensure all required directories exist
     ensure_directories_exist()
 
@@ -551,8 +557,14 @@ def start_file_watcher():
     logger.info(f"Isolation model location: {ISOLATION_MODEL_FILE}")
     logger.info(f"Results directory: {RESULTS_DIR}")
     logger.info(f"Columns to ignore: {COLUMNS_TO_IGNORE}")
-    logger.info("Waiting for CSV files...")
+    logger.info("Queue-based processing: Files processed one at a time (FIFO)")
     logger.info("-" * 60)
+
+    # Start the queue processor thread
+    queue_processor_running = True
+    processor_thread = threading.Thread(target=queue_processor, daemon=True)
+    processor_thread.start()
+    logger.info("Queue processor thread started.")
 
     # Create event handler and observer
     event_handler = CSVEventHandler()
@@ -563,6 +575,8 @@ def start_file_watcher():
 
     # Start the observer
     observer.start()
+    logger.info("File watcher started. Waiting for CSV files...")
+    logger.info("-" * 60)
 
     try:
         # Keep the service running
@@ -570,10 +584,19 @@ def start_file_watcher():
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Shutdown signal received. Stopping ingestion service...")
+
+        # Stop the queue processor
+        queue_processor_running = False
+
+        # Stop the observer
         observer.stop()
 
     # Wait for observer thread to finish
     observer.join()
+
+    # Wait for queue processor to finish
+    processor_thread.join(timeout=5.0)
+
     logger.info("Ingestion service stopped.")
 
 
@@ -581,35 +604,32 @@ def process_existing_files():
     """
     Process any existing CSV files in the input directory.
 
-    This function is useful for processing files that were added
-    before the watcher started.
+    This function adds existing files to the queue for processing.
+    Files are processed in alphabetical order.
     """
     ensure_directories_exist()
     load_serial_counter()
 
     logger.info("Checking for existing CSV files in input directory...")
 
-    existing_files = [
+    existing_files = sorted([
         f for f in os.listdir(INPUT_CSV_DIR)
         if f.lower().endswith(WATCH_EXTENSION)
-    ]
+    ])
 
     if not existing_files:
         logger.info("No existing CSV files found.")
         return
 
-    logger.info(f"Found {len(existing_files)} existing CSV file(s) to process.")
+    logger.info(f"Found {len(existing_files)} existing CSV file(s). Adding to queue...")
 
     for file_name in existing_files:
         file_path = os.path.join(INPUT_CSV_DIR, file_name)
-        logger.info(f"Processing existing file: {file_name}")
+        file_queue.put(file_path)
+        logger.info(f"Queued existing file: {file_name}")
 
-        success = process_csv_file(file_path)
+    logger.info(f"All {len(existing_files)} existing files added to queue.")
 
-        if success:
-            move_to_processed(file_path)
-        else:
-            logger.error(f"Failed to process existing file: {file_name}")
 
 
 # =============================================================================
