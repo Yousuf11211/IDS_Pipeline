@@ -196,9 +196,17 @@ TIMESTAMP - LEVEL - MESSAGE
 - Check that the file is a valid CSV format
 - Look at `logs/ingestion.log` for specific error messages
 
+### Model not found error
+- Ensure `isolation_forest_model.pkl` is in the `isolation_model/` folder
+- Check that the model was saved correctly with pickle
+- Verify the model is a valid scikit-learn IsolationForest
+
 ### File not moved after processing
 - Check for write permissions on `processed_csv/`
 - Review error messages in the log file
+
+### Non-numeric column warnings
+- Add non-numeric columns (like IP addresses, timestamps) to `COLUMNS_TO_IGNORE` in `settings.py`
 
 ## 📄 License
 
@@ -206,5 +214,5 @@ This project is part of the IDS/NIDS Pipeline initiative.
 
 ---
 
-**Version**: 1.0.0 (Phase 1 - Ingestion Only)  
+**Version**: 2.0.0 (Phase 2 - Isolation Model Integration)  
 **Last Updated**: January 2026

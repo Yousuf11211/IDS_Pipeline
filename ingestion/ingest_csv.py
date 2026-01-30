@@ -2,10 +2,16 @@
 CSV Ingestion Service for IDS/NIDS Pipeline.
 
 This module implements a file-watching service that automatically detects
-new CSV files in the input directory, validates them, and prepares them
-for future database insertion.
+new CSV files in the input directory, processes them row by row through
+an isolation model for anomaly detection, and outputs results to separate
+CSV files for benign and malicious traffic.
 
-Database integration is intentionally disabled in this phase.
+Flow:
+1. Watch input_csv/ folder for new CSV files
+2. Process each row with a unique serial number
+3. Send row (excluding ignored columns) to isolation model
+4. Append result to benign_results.csv or malicious_results.csv
+5. Move processed CSV to processed_csv/ folder
 """
 
 import os
@@ -13,9 +19,11 @@ import sys
 import time
 import shutil
 import logging
+import pickle
 from datetime import datetime
 
 import pandas as pd
+import numpy as np
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -30,7 +38,15 @@ from config.settings import (
     LOG_FORMAT,
     LOG_DATE_FORMAT,
     FILE_STABILITY_DELAY,
-    WATCH_EXTENSION
+    WATCH_EXTENSION,
+    ISOLATION_MODEL_DIR,
+    ISOLATION_MODEL_FILE,
+    RESULTS_DIR,
+    BENIGN_RESULTS_FILE,
+    MALICIOUS_RESULTS_FILE,
+    COLUMNS_TO_IGNORE,
+    ANOMALY_LABEL,
+    NORMAL_LABEL
 )
 
 
@@ -83,12 +99,169 @@ def ensure_directories_exist():
     """
     Create required directories if they don't exist.
     """
-    directories = [INPUT_CSV_DIR, PROCESSED_CSV_DIR, LOGS_DIR]
+    directories = [
+        INPUT_CSV_DIR,
+        PROCESSED_CSV_DIR,
+        LOGS_DIR,
+        ISOLATION_MODEL_DIR,
+        RESULTS_DIR
+    ]
 
     for directory in directories:
         if not os.path.exists(directory):
             os.makedirs(directory)
             logger.info(f"Created directory: {directory}")
+
+
+# =============================================================================
+# ISOLATION MODEL LOADER
+# =============================================================================
+
+# Global variable to store loaded model
+_isolation_model = None
+
+
+def load_isolation_model():
+    """
+    Load the isolation forest model from the model file.
+
+    Returns:
+        model: The loaded isolation forest model, or None if loading fails.
+    """
+    global _isolation_model
+
+    if _isolation_model is not None:
+        return _isolation_model
+
+    if not os.path.exists(ISOLATION_MODEL_FILE):
+        logger.error(f"Isolation model not found at: {ISOLATION_MODEL_FILE}")
+        logger.error("Please place your trained isolation_forest_model.pkl in the isolation_model/ folder")
+        return None
+
+    try:
+        with open(ISOLATION_MODEL_FILE, 'rb') as f:
+            _isolation_model = pickle.load(f)
+        logger.info(f"Isolation model loaded successfully from: {ISOLATION_MODEL_FILE}")
+        return _isolation_model
+    except Exception as e:
+        logger.error(f"Failed to load isolation model: {str(e)}")
+        return None
+
+
+def predict_anomaly(model, row_data):
+    """
+    Use the isolation model to predict if a row is anomaly or normal.
+
+    Args:
+        model: The loaded isolation forest model
+        row_data: numpy array or list of feature values (excluding ignored columns)
+
+    Returns:
+        int: 1 for normal (benign), -1 for anomaly (malicious)
+    """
+    try:
+        # Reshape for single prediction
+        features = np.array(row_data).reshape(1, -1)
+        prediction = model.predict(features)
+        return prediction[0]
+    except Exception as e:
+        logger.error(f"Prediction error: {str(e)}")
+        # Default to anomaly on error for safety
+        return ANOMALY_LABEL
+
+
+# =============================================================================
+# RESULTS FILE HANDLING
+# =============================================================================
+
+def initialize_results_files(columns):
+    """
+    Initialize the results CSV files with headers if they don't exist.
+
+    Args:
+        columns: List of column names for the results files
+    """
+    # Add serial_number at the beginning and label at the end
+    header_columns = ['serial_number'] + columns + ['label']
+
+    for results_file, label in [(BENIGN_RESULTS_FILE, 'benign'), (MALICIOUS_RESULTS_FILE, 'malicious')]:
+        if not os.path.exists(results_file):
+            # Create empty CSV with headers
+            df_header = pd.DataFrame(columns=header_columns)
+            df_header.to_csv(results_file, index=False)
+            logger.info(f"Created {label} results file: {results_file}")
+
+
+def append_to_results(row_data, label, serial_number, columns):
+    """
+    Append a row to the appropriate results CSV file.
+
+    Args:
+        row_data: Dictionary of column values
+        label: 'benign' or 'malicious'
+        serial_number: Unique serial number for this row
+        columns: List of original column names
+    """
+    # Determine which file to write to
+    if label == 'benign':
+        results_file = BENIGN_RESULTS_FILE
+    else:
+        results_file = MALICIOUS_RESULTS_FILE
+
+    # Build the row with serial number at start and label at end
+    output_row = {'serial_number': serial_number}
+    for col in columns:
+        output_row[col] = row_data.get(col, '')
+    output_row['label'] = label
+
+    # Append to CSV
+    df_row = pd.DataFrame([output_row])
+
+    # Append without header if file exists and has content
+    file_exists = os.path.exists(results_file) and os.path.getsize(results_file) > 0
+    df_row.to_csv(results_file, mode='a', header=not file_exists, index=False)
+
+
+# =============================================================================
+# SERIAL NUMBER GENERATOR
+# =============================================================================
+
+# Global serial number counter (will be loaded from file or start fresh)
+_serial_counter = 0
+SERIAL_COUNTER_FILE = os.path.join(LOGS_DIR, ".serial_counter")
+
+
+def load_serial_counter():
+    """Load the serial counter from file or initialize to 0."""
+    global _serial_counter
+
+    if os.path.exists(SERIAL_COUNTER_FILE):
+        try:
+            with open(SERIAL_COUNTER_FILE, 'r') as f:
+                _serial_counter = int(f.read().strip())
+                logger.info(f"Loaded serial counter: {_serial_counter}")
+        except Exception:
+            _serial_counter = 0
+    else:
+        _serial_counter = 0
+
+
+def save_serial_counter():
+    """Save the current serial counter to file."""
+    global _serial_counter
+    try:
+        with open(SERIAL_COUNTER_FILE, 'w') as f:
+            f.write(str(_serial_counter))
+    except Exception as e:
+        logger.error(f"Failed to save serial counter: {str(e)}")
+
+
+def get_next_serial_number():
+    """Get the next unique serial number."""
+    global _serial_counter
+    _serial_counter += 1
+    save_serial_counter()
+    return _serial_counter
 
 
 # =============================================================================
@@ -131,13 +304,41 @@ def validate_csv_file(file_path):
         return False, None, f"Unexpected error reading CSV: {str(e)}"
 
 
+def get_model_features(row, columns):
+    """
+    Extract features for the model, excluding ignored columns.
+
+    Args:
+        row: Pandas Series representing one row
+        columns: List of all column names
+
+    Returns:
+        list: Feature values for model prediction
+    """
+    features = []
+    for col in columns:
+        if col not in COLUMNS_TO_IGNORE:
+            value = row[col]
+            # Convert to numeric if possible, otherwise skip or use 0
+            try:
+                features.append(float(value))
+            except (ValueError, TypeError):
+                # Non-numeric columns that aren't in ignore list
+                # You might want to handle these differently
+                features.append(0)
+    return features
+
+
 def process_csv_file(file_path):
     """
-    Process a CSV file: validate, parse rows, and prepare for database insertion.
+    Process a CSV file row by row through the isolation model.
 
-    This function reads and validates the CSV without transforming columns
-    or connecting to any database. It prepares the data conceptually for
-    future insertion into a raw_packets table.
+    This function:
+    1. Reads and validates the CSV
+    2. Assigns a unique serial number to each row
+    3. Sends each row (minus ignored columns) to the isolation model
+    4. Appends results to benign_results.csv or malicious_results.csv
+    5. All original columns (including ignored ones) are preserved in output
 
     Args:
         file_path (str): Path to the CSV file to process.
@@ -158,38 +359,65 @@ def process_csv_file(file_path):
     # Log successful validation and row count
     row_count = len(df)
     column_count = len(df.columns)
+    columns = list(df.columns)
+
     logger.info(f"CSV validated successfully: {file_name}")
     logger.info(f"Rows detected: {row_count}")
     logger.info(f"Columns detected: {column_count}")
-    logger.info(f"Column names: {list(df.columns)}")
+    logger.info(f"Column names: {columns}")
+    logger.info(f"Columns to ignore for model: {COLUMNS_TO_IGNORE}")
 
-    # ==========================================================================
-    # TODO: DATABASE INSERTION LOGIC (FUTURE PHASE)
-    # ==========================================================================
-    # The following section is a placeholder for future database integration.
-    #
-    # When database integration is enabled:
-    # 1. Map CSV columns to raw_packets table schema
-    # 2. Transform data types as needed
-    # 3. Insert rows into the database
-    #
-    # Column mappings will be implemented later once the schema is finalized.
-    # DO NOT assume column names match the database schema.
-    # ==========================================================================
+    # Load isolation model
+    model = load_isolation_model()
+    if model is None:
+        logger.error("Cannot process without isolation model. Please add model to isolation_model/ folder.")
+        return False
 
-    # Conceptual preparation for database insertion
-    # In this phase, we only mark the data as "ready for DB"
-    ready_for_db = True
+    # Initialize results files with proper headers
+    initialize_results_files(columns)
 
-    if ready_for_db:
-        logger.info(f"Data from {file_name} is prepared and ready for future DB insertion")
-        logger.info(f"Total rows ready for raw_packets table: {row_count}")
+    # Process each row
+    benign_count = 0
+    malicious_count = 0
 
-    # TODO: Implement actual database insertion here when DB integration is enabled
-    # Example future code:
-    # connection = create_db_connection()
-    # insert_rows_to_raw_packets(connection, df)
-    # connection.close()
+    logger.info(f"Processing {row_count} rows through isolation model...")
+
+    for index, row in df.iterrows():
+        # Get unique serial number for this row
+        serial_number = get_next_serial_number()
+
+        # Get features for model (excluding ignored columns)
+        features = get_model_features(row, columns)
+
+        # Predict using isolation model
+        prediction = predict_anomaly(model, features)
+
+        # Convert row to dictionary for output
+        row_dict = row.to_dict()
+
+        # Determine label and append to appropriate file
+        if prediction == NORMAL_LABEL:
+            label = 'benign'
+            benign_count += 1
+        else:
+            label = 'malicious'
+            malicious_count += 1
+
+        # Append to results file (includes all columns + serial number + label)
+        append_to_results(row_dict, label, serial_number, columns)
+
+        # Log progress every 1000 rows
+        if (index + 1) % 1000 == 0:
+            logger.info(f"Processed {index + 1}/{row_count} rows...")
+
+    # Final summary
+    logger.info(f"Processing complete for {file_name}")
+    logger.info(f"Total rows processed: {row_count}")
+    logger.info(f"Benign (normal) rows: {benign_count}")
+    logger.info(f"Malicious (anomaly) rows: {malicious_count}")
+    logger.info(f"Results saved to:")
+    logger.info(f"  - Benign: {BENIGN_RESULTS_FILE}")
+    logger.info(f"  - Malicious: {MALICIOUS_RESULTS_FILE}")
 
     return True
 
@@ -312,11 +540,17 @@ def start_file_watcher():
     # Ensure all required directories exist
     ensure_directories_exist()
 
+    # Load serial counter
+    load_serial_counter()
+
     logger.info("=" * 60)
     logger.info("IDS/NIDS Pipeline - CSV Ingestion Service Starting")
     logger.info("=" * 60)
     logger.info(f"Monitoring directory: {INPUT_CSV_DIR}")
     logger.info(f"Processed files will be moved to: {PROCESSED_CSV_DIR}")
+    logger.info(f"Isolation model location: {ISOLATION_MODEL_FILE}")
+    logger.info(f"Results directory: {RESULTS_DIR}")
+    logger.info(f"Columns to ignore: {COLUMNS_TO_IGNORE}")
     logger.info("Waiting for CSV files...")
     logger.info("-" * 60)
 
@@ -351,6 +585,7 @@ def process_existing_files():
     before the watcher started.
     """
     ensure_directories_exist()
+    load_serial_counter()
 
     logger.info("Checking for existing CSV files in input directory...")
 
@@ -391,7 +626,12 @@ if __name__ == "__main__":
     The service will:
     1. Process any existing CSV files in input_csv/
     2. Start monitoring for new CSV files
-    3. Continue running until interrupted (Ctrl+C)
+    3. For each CSV:
+       - Assign unique serial numbers to each row
+       - Send rows (minus ignored columns) to isolation model
+       - Output results to benign_results.csv or malicious_results.csv
+       - Move processed CSV to processed_csv/
+    4. Continue running until interrupted (Ctrl+C)
     """
     # First, process any existing files
     process_existing_files()

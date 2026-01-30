@@ -56,3 +56,44 @@ FILE_STABILITY_DELAY = 1.0
 
 # File extension to watch for
 WATCH_EXTENSION = ".csv"
+
+# =============================================================================
+# ISOLATION MODEL CONFIGURATION
+# =============================================================================
+
+# Folder for isolation model
+ISOLATION_MODEL_DIR = os.path.join(BASE_DIR, "isolation_model")
+ISOLATION_MODEL_FILE = os.path.join(ISOLATION_MODEL_DIR, "isolation_forest_model.pkl")
+
+# =============================================================================
+# RESULTS CONFIGURATION
+# =============================================================================
+
+# Folder for results
+RESULTS_DIR = os.path.join(BASE_DIR, "results")
+BENIGN_RESULTS_FILE = os.path.join(RESULTS_DIR, "benign_results.csv")
+MALICIOUS_RESULTS_FILE = os.path.join(RESULTS_DIR, "malicious_results.csv")
+
+# =============================================================================
+# COLUMNS TO IGNORE FOR MODEL PREDICTION
+# =============================================================================
+# List of column names to exclude when sending data to the isolation model
+# These columns will still appear in the final results CSV
+# Add column names here that should not be used for anomaly detection
+
+COLUMNS_TO_IGNORE = [
+    # Add column names to ignore here, for example:
+    # "timestamp",
+    # "source_ip",
+    # "destination_ip",
+    # "protocol",
+]
+
+# =============================================================================
+# MODEL CONFIGURATION
+# =============================================================================
+
+# Threshold for anomaly detection (-1 = anomaly/malicious, 1 = normal/benign)
+# The isolation model outputs -1 for anomalies and 1 for normal instances
+ANOMALY_LABEL = -1
+NORMAL_LABEL = 1
