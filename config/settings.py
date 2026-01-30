@@ -63,7 +63,7 @@ WATCH_EXTENSION = ".csv"
 
 # Folder for isolation model
 ISOLATION_MODEL_DIR = os.path.join(BASE_DIR, "isolation_model")
-ISOLATION_MODEL_FILE = os.path.join(ISOLATION_MODEL_DIR, "isolation_forest_model.pkl")
+ISOLATION_MODEL_FILE = os.path.join(ISOLATION_MODEL_DIR, "isolation.joblib")
 
 # =============================================================================
 # RESULTS CONFIGURATION
@@ -96,3 +96,12 @@ COLUMNS_TO_IGNORE = [
 # The isolation model outputs -1 for anomalies and 1 for normal instances
 ANOMALY_LABEL = -1
 NORMAL_LABEL = 1
+
+# =============================================================================
+# CHUNKED PROCESSING CONFIGURATION
+# =============================================================================
+
+# Number of rows to load into memory at a time
+# This prevents memory issues with large CSV files
+CHUNK_SIZE = 1000
+

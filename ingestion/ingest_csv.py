@@ -20,7 +20,7 @@ import sys
 import time
 import shutil
 import logging
-import pickle
+import joblib
 import threading
 from queue import Queue
 from datetime import datetime
@@ -49,7 +49,8 @@ from config.settings import (
     MALICIOUS_RESULTS_FILE,
     COLUMNS_TO_IGNORE,
     ANOMALY_LABEL,
-    NORMAL_LABEL
+    NORMAL_LABEL,
+    CHUNK_SIZE
 )
 
 
@@ -122,7 +123,7 @@ _isolation_model = None
 
 
 def load_isolation_model():
-    """Load the isolation forest model from the model file."""
+    """Load the isolation forest model from the model file using joblib."""
     global _isolation_model
 
     if _isolation_model is not None:
@@ -130,12 +131,11 @@ def load_isolation_model():
 
     if not os.path.exists(ISOLATION_MODEL_FILE):
         logger.error(f"Isolation model not found at: {ISOLATION_MODEL_FILE}")
-        logger.error("Please place your trained isolation_forest_model.pkl in the isolation_model/ folder")
+        logger.error("Please place your trained isolation.joblib in the isolation_model/ folder")
         return None
 
     try:
-        with open(ISOLATION_MODEL_FILE, 'rb') as f:
-            _isolation_model = pickle.load(f)
+        _isolation_model = joblib.load(ISOLATION_MODEL_FILE)
         logger.info(f"Isolation model loaded successfully from: {ISOLATION_MODEL_FILE}")
         return _isolation_model
     except Exception as e:
@@ -239,7 +239,7 @@ def get_next_serial_number():
 # =============================================================================
 
 def validate_csv_file(file_path):
-    """Validate that a CSV file is readable and not empty."""
+    """Validate that a CSV file is readable and not empty (without loading entire file)."""
     try:
         if not os.path.exists(file_path):
             return False, None, "File does not exist"
@@ -247,12 +247,14 @@ def validate_csv_file(file_path):
         if os.path.getsize(file_path) == 0:
             return False, None, "File is empty (0 bytes)"
 
-        df = pd.read_csv(file_path)
+        # Only read first few rows to validate and get columns
+        df_sample = pd.read_csv(file_path, nrows=5)
 
-        if df.empty:
+        if df_sample.empty:
             return False, None, "CSV file has no data rows"
 
-        return True, df, None
+        # Return column names instead of full dataframe
+        return True, list(df_sample.columns), None
 
     except pd.errors.EmptyDataError:
         return False, None, "CSV file is empty or has no parseable data"
@@ -260,6 +262,16 @@ def validate_csv_file(file_path):
         return False, None, f"CSV parsing error: {str(e)}"
     except Exception as e:
         return False, None, f"Unexpected error reading CSV: {str(e)}"
+
+
+def count_csv_rows(file_path):
+    """Count total rows in CSV without loading into memory."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            # Subtract 1 for header row
+            return sum(1 for _ in f) - 1
+    except Exception:
+        return 0
 
 
 def get_model_features(row, columns):
@@ -277,27 +289,29 @@ def get_model_features(row, columns):
 
 def process_csv_file(file_path):
     """
-    Process a CSV file row by row through the isolation model.
+    Process a CSV file in chunks through the isolation model.
+    Only loads CHUNK_SIZE rows into memory at a time.
     Shows LIVE progress updates for each row processed.
     """
     file_name = os.path.basename(file_path)
     logger.info(f"Starting processing of CSV file: {file_name}")
 
-    is_valid, df, error_message = validate_csv_file(file_path)
+    is_valid, columns, error_message = validate_csv_file(file_path)
 
     if not is_valid:
         logger.error(f"Validation failed for {file_name}: {error_message}")
         return False
 
-    row_count = len(df)
-    column_count = len(df.columns)
-    columns = list(df.columns)
+    # Count total rows without loading entire file
+    row_count = count_csv_rows(file_path)
+    column_count = len(columns)
 
     logger.info(f"CSV validated successfully: {file_name}")
     logger.info(f"Rows detected: {row_count}")
     logger.info(f"Columns detected: {column_count}")
     logger.info(f"Column names: {columns}")
     logger.info(f"Columns to ignore for model: {COLUMNS_TO_IGNORE}")
+    logger.info(f"Processing in chunks of {CHUNK_SIZE} rows (memory efficient)")
 
     model = load_isolation_model()
     if model is None:
@@ -308,34 +322,38 @@ def process_csv_file(file_path):
 
     benign_count = 0
     malicious_count = 0
+    processed_rows = 0
 
     logger.info(f"Processing {row_count} rows through isolation model...")
     print()  # Empty line for cleaner output
 
-    for index, row in df.iterrows():
-        serial_number = get_next_serial_number()
-        features = get_model_features(row, columns)
-        prediction = predict_anomaly(model, features)
-        row_dict = row.to_dict()
+    # Process CSV in chunks - only CHUNK_SIZE rows in memory at a time
+    for chunk in pd.read_csv(file_path, chunksize=CHUNK_SIZE):
+        for index, row in chunk.iterrows():
+            serial_number = get_next_serial_number()
+            features = get_model_features(row, columns)
+            prediction = predict_anomaly(model, features)
+            row_dict = row.to_dict()
 
-        if prediction == NORMAL_LABEL:
-            label = 'benign'
-            benign_count += 1
-        else:
-            label = 'malicious'
-            malicious_count += 1
+            if prediction == NORMAL_LABEL:
+                label = 'benign'
+                benign_count += 1
+            else:
+                label = 'malicious'
+                malicious_count += 1
 
-        append_to_results(row_dict, label, serial_number, columns)
+            append_to_results(row_dict, label, serial_number, columns)
+            processed_rows += 1
 
-        # LIVE progress update - overwrites same line for real-time feedback
-        progress = ((index + 1) / row_count) * 100
-        sys.stdout.write(f"\r[LIVE] Row {index + 1}/{row_count} ({progress:.1f}%) | Serial: {serial_number} | Result: {label.upper():10} | Benign: {benign_count} | Malicious: {malicious_count}")
-        sys.stdout.flush()
+            # LIVE progress update - overwrites same line for real-time feedback
+            progress = (processed_rows / row_count) * 100 if row_count > 0 else 100
+            sys.stdout.write(f"\r[LIVE] Row {processed_rows}/{row_count} ({progress:.1f}%) | Serial: {serial_number} | Result: {label.upper():10} | Benign: {benign_count} | Malicious: {malicious_count}")
+            sys.stdout.flush()
 
     print()  # New line after progress complete
 
     logger.info(f"Processing complete for {file_name}")
-    logger.info(f"Total rows processed: {row_count}")
+    logger.info(f"Total rows processed: {processed_rows}")
     logger.info(f"Benign (normal) rows: {benign_count}")
     logger.info(f"Malicious (anomaly) rows: {malicious_count}")
     logger.info(f"Results saved to:")
