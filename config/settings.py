@@ -82,11 +82,10 @@ MALICIOUS_RESULTS_FILE = os.path.join(RESULTS_DIR, "malicious_results.csv")
 # Add column names here that should not be used for anomaly detection
 
 COLUMNS_TO_IGNORE = [
-    # Add column names to ignore here, for example:
-    # "timestamp",
-    # "source_ip",
-    # "destination_ip",
-    # "protocol",
+    # Columns that were not used to train the model
+    "timestamp",
+    "src_ip",
+    "label",
 ]
 
 # =============================================================================

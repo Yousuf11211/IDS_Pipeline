@@ -8,10 +8,11 @@ CSV files for benign and malicious traffic.
 
 Flow:
 1. Watch input_csv/ folder for new CSV files
-2. Process each row with a unique serial number
-3. Send row (excluding ignored columns) to isolation model
-4. Append result to benign_results.csv or malicious_results.csv
-5. Move processed CSV to processed_csv/ folder
+2. Add detected CSVs to a processing queue (FIFO)
+3. Process each CSV one by one from the queue
+4. For each row: assign serial number, send to isolation model
+5. Append result to benign_results.csv or malicious_results.csv (LIVE updates)
+6. Move processed CSV to processed_csv/ folder
 """
 
 import os
@@ -20,6 +21,8 @@ import time
 import shutil
 import logging
 import pickle
+import threading
+from queue import Queue
 from datetime import datetime
 
 import pandas as pd
@@ -59,28 +62,22 @@ def setup_logging():
     Configure logging to write to both file and console.
     Creates the logs directory if it doesn't exist.
     """
-    # Ensure logs directory exists
     os.makedirs(LOGS_DIR, exist_ok=True)
 
-    # Configure root logger
     logger = logging.getLogger("ingestion")
     logger.setLevel(logging.INFO)
 
-    # Prevent duplicate handlers if called multiple times
     if logger.handlers:
         return logger
 
-    # File handler - logs to ingestion.log
     file_handler = logging.FileHandler(LOG_FILE)
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
 
-    # Console handler - logs to stdout
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
 
-    # Add handlers to logger
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
@@ -90,15 +87,19 @@ def setup_logging():
 # Initialize logger
 logger = setup_logging()
 
+# Global queue for CSV files to be processed (FIFO - First In, First Out)
+file_queue = Queue()
+
+# Flag to control the queue processor thread
+queue_processor_running = True
+
 
 # =============================================================================
 # DIRECTORY SETUP
 # =============================================================================
 
 def ensure_directories_exist():
-    """
-    Create required directories if they don't exist.
-    """
+    """Create required directories if they don't exist."""
     directories = [
         INPUT_CSV_DIR,
         PROCESSED_CSV_DIR,
@@ -117,17 +118,11 @@ def ensure_directories_exist():
 # ISOLATION MODEL LOADER
 # =============================================================================
 
-# Global variable to store loaded model
 _isolation_model = None
 
 
 def load_isolation_model():
-    """
-    Load the isolation forest model from the model file.
-
-    Returns:
-        model: The loaded isolation forest model, or None if loading fails.
-    """
+    """Load the isolation forest model from the model file."""
     global _isolation_model
 
     if _isolation_model is not None:
@@ -149,24 +144,13 @@ def load_isolation_model():
 
 
 def predict_anomaly(model, row_data):
-    """
-    Use the isolation model to predict if a row is anomaly or normal.
-
-    Args:
-        model: The loaded isolation forest model
-        row_data: numpy array or list of feature values (excluding ignored columns)
-
-    Returns:
-        int: 1 for normal (benign), -1 for anomaly (malicious)
-    """
+    """Use the isolation model to predict if a row is anomaly or normal."""
     try:
-        # Reshape for single prediction
         features = np.array(row_data).reshape(1, -1)
         prediction = model.predict(features)
         return prediction[0]
     except Exception as e:
         logger.error(f"Prediction error: {str(e)}")
-        # Default to anomaly on error for safety
         return ANOMALY_LABEL
 
 
@@ -175,18 +159,11 @@ def predict_anomaly(model, row_data):
 # =============================================================================
 
 def initialize_results_files(columns):
-    """
-    Initialize the results CSV files with headers if they don't exist.
-
-    Args:
-        columns: List of column names for the results files
-    """
-    # Add serial_number at the beginning and label at the end
+    """Initialize the results CSV files with headers if they don't exist."""
     header_columns = ['serial_number'] + columns + ['label']
 
     for results_file, label in [(BENIGN_RESULTS_FILE, 'benign'), (MALICIOUS_RESULTS_FILE, 'malicious')]:
         if not os.path.exists(results_file):
-            # Create empty CSV with headers
             df_header = pd.DataFrame(columns=header_columns)
             df_header.to_csv(results_file, index=False)
             logger.info(f"Created {label} results file: {results_file}")
@@ -195,38 +172,31 @@ def initialize_results_files(columns):
 def append_to_results(row_data, label, serial_number, columns):
     """
     Append a row to the appropriate results CSV file.
-
-    Args:
-        row_data: Dictionary of column values
-        label: 'benign' or 'malicious'
-        serial_number: Unique serial number for this row
-        columns: List of original column names
+    Writes immediately (no buffering) for live updates.
     """
-    # Determine which file to write to
     if label == 'benign':
         results_file = BENIGN_RESULTS_FILE
     else:
         results_file = MALICIOUS_RESULTS_FILE
 
-    # Build the row with serial number at start and label at end
     output_row = {'serial_number': serial_number}
     for col in columns:
         output_row[col] = row_data.get(col, '')
     output_row['label'] = label
 
-    # Append to CSV
     df_row = pd.DataFrame([output_row])
-
-    # Append without header if file exists and has content
     file_exists = os.path.exists(results_file) and os.path.getsize(results_file) > 0
-    df_row.to_csv(results_file, mode='a', header=not file_exists, index=False)
+
+    # Write with flush for immediate live update
+    with open(results_file, 'a', newline='', encoding='utf-8') as f:
+        df_row.to_csv(f, header=not file_exists, index=False)
+        f.flush()
 
 
 # =============================================================================
 # SERIAL NUMBER GENERATOR
 # =============================================================================
 
-# Global serial number counter (will be loaded from file or start fresh)
 _serial_counter = 0
 SERIAL_COUNTER_FILE = os.path.join(LOGS_DIR, ".serial_counter")
 
@@ -269,28 +239,16 @@ def get_next_serial_number():
 # =============================================================================
 
 def validate_csv_file(file_path):
-    """
-    Validate that a CSV file is readable and not empty.
-
-    Args:
-        file_path (str): Path to the CSV file to validate.
-
-    Returns:
-        tuple: (is_valid: bool, dataframe: pd.DataFrame or None, error_message: str or None)
-    """
+    """Validate that a CSV file is readable and not empty."""
     try:
-        # Check if file exists
         if not os.path.exists(file_path):
             return False, None, "File does not exist"
 
-        # Check if file is readable and not empty
         if os.path.getsize(file_path) == 0:
             return False, None, "File is empty (0 bytes)"
 
-        # Attempt to read the CSV file
         df = pd.read_csv(file_path)
 
-        # Check if dataframe has any rows
         if df.empty:
             return False, None, "CSV file has no data rows"
 
@@ -305,26 +263,14 @@ def validate_csv_file(file_path):
 
 
 def get_model_features(row, columns):
-    """
-    Extract features for the model, excluding ignored columns.
-
-    Args:
-        row: Pandas Series representing one row
-        columns: List of all column names
-
-    Returns:
-        list: Feature values for model prediction
-    """
+    """Extract features for the model, excluding ignored columns."""
     features = []
     for col in columns:
         if col not in COLUMNS_TO_IGNORE:
             value = row[col]
-            # Convert to numeric if possible, otherwise skip or use 0
             try:
                 features.append(float(value))
             except (ValueError, TypeError):
-                # Non-numeric columns that aren't in ignore list
-                # You might want to handle these differently
                 features.append(0)
     return features
 
@@ -332,31 +278,17 @@ def get_model_features(row, columns):
 def process_csv_file(file_path):
     """
     Process a CSV file row by row through the isolation model.
-
-    This function:
-    1. Reads and validates the CSV
-    2. Assigns a unique serial number to each row
-    3. Sends each row (minus ignored columns) to the isolation model
-    4. Appends results to benign_results.csv or malicious_results.csv
-    5. All original columns (including ignored ones) are preserved in output
-
-    Args:
-        file_path (str): Path to the CSV file to process.
-
-    Returns:
-        bool: True if processing was successful, False otherwise.
+    Shows LIVE progress updates for each row processed.
     """
     file_name = os.path.basename(file_path)
     logger.info(f"Starting processing of CSV file: {file_name}")
 
-    # Validate the CSV file
     is_valid, df, error_message = validate_csv_file(file_path)
 
     if not is_valid:
         logger.error(f"Validation failed for {file_name}: {error_message}")
         return False
 
-    # Log successful validation and row count
     row_count = len(df)
     column_count = len(df.columns)
     columns = list(df.columns)
@@ -367,35 +299,25 @@ def process_csv_file(file_path):
     logger.info(f"Column names: {columns}")
     logger.info(f"Columns to ignore for model: {COLUMNS_TO_IGNORE}")
 
-    # Load isolation model
     model = load_isolation_model()
     if model is None:
         logger.error("Cannot process without isolation model. Please add model to isolation_model/ folder.")
         return False
 
-    # Initialize results files with proper headers
     initialize_results_files(columns)
 
-    # Process each row
     benign_count = 0
     malicious_count = 0
 
     logger.info(f"Processing {row_count} rows through isolation model...")
+    print()  # Empty line for cleaner output
 
     for index, row in df.iterrows():
-        # Get unique serial number for this row
         serial_number = get_next_serial_number()
-
-        # Get features for model (excluding ignored columns)
         features = get_model_features(row, columns)
-
-        # Predict using isolation model
         prediction = predict_anomaly(model, features)
-
-        # Convert row to dictionary for output
         row_dict = row.to_dict()
 
-        # Determine label and append to appropriate file
         if prediction == NORMAL_LABEL:
             label = 'benign'
             benign_count += 1
@@ -403,14 +325,15 @@ def process_csv_file(file_path):
             label = 'malicious'
             malicious_count += 1
 
-        # Append to results file (includes all columns + serial number + label)
         append_to_results(row_dict, label, serial_number, columns)
 
-        # Log progress every 1000 rows
-        if (index + 1) % 1000 == 0:
-            logger.info(f"Processed {index + 1}/{row_count} rows...")
+        # LIVE progress update - overwrites same line for real-time feedback
+        progress = ((index + 1) / row_count) * 100
+        sys.stdout.write(f"\r[LIVE] Row {index + 1}/{row_count} ({progress:.1f}%) | Serial: {serial_number} | Result: {label.upper():10} | Benign: {benign_count} | Malicious: {malicious_count}")
+        sys.stdout.flush()
 
-    # Final summary
+    print()  # New line after progress complete
+
     logger.info(f"Processing complete for {file_name}")
     logger.info(f"Total rows processed: {row_count}")
     logger.info(f"Benign (normal) rows: {benign_count}")
@@ -423,20 +346,11 @@ def process_csv_file(file_path):
 
 
 def move_to_processed(file_path):
-    """
-    Move a successfully processed CSV file to the processed_csv directory.
-
-    Args:
-        file_path (str): Path to the file to move.
-
-    Returns:
-        bool: True if move was successful, False otherwise.
-    """
+    """Move a successfully processed CSV file to the processed_csv directory."""
     file_name = os.path.basename(file_path)
     destination = os.path.join(PROCESSED_CSV_DIR, file_name)
 
     try:
-        # Handle duplicate filenames by adding timestamp
         if os.path.exists(destination):
             base_name, extension = os.path.splitext(file_name)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -444,7 +358,6 @@ def move_to_processed(file_path):
             destination = os.path.join(PROCESSED_CSV_DIR, new_filename)
             logger.warning(f"Duplicate filename detected. Renaming to: {new_filename}")
 
-        # Move the file
         shutil.move(file_path, destination)
         logger.info(f"File moved successfully: {file_name} -> processed_csv/")
         return True
@@ -455,75 +368,95 @@ def move_to_processed(file_path):
 
 
 # =============================================================================
+# QUEUE PROCESSOR
+# =============================================================================
+
+def queue_processor():
+    """
+    Worker thread that processes files from the queue one by one.
+    Ensures files are processed sequentially in FIFO order.
+    """
+    global queue_processor_running
+
+    logger.info("Queue processor started - waiting for files...")
+
+    while queue_processor_running:
+        try:
+            try:
+                file_path = file_queue.get(timeout=1.0)
+            except:
+                continue
+
+            file_name = os.path.basename(file_path)
+            queue_size = file_queue.qsize()
+
+            logger.info(f"Processing from queue: {file_name} (remaining in queue: {queue_size})")
+
+            if not os.path.exists(file_path):
+                logger.warning(f"File no longer exists, skipping: {file_name}")
+                file_queue.task_done()
+                continue
+
+            try:
+                success = process_csv_file(file_path)
+
+                if success:
+                    move_to_processed(file_path)
+                else:
+                    logger.error(f"Processing failed for: {file_name}")
+
+            except Exception as e:
+                logger.error(f"Unexpected error processing {file_name}: {str(e)}")
+
+            file_queue.task_done()
+
+        except Exception as e:
+            logger.error(f"Queue processor error: {str(e)}")
+
+    logger.info("Queue processor stopped.")
+
+
+# =============================================================================
 # FILE WATCHER EVENT HANDLER
 # =============================================================================
 
 class CSVEventHandler(FileSystemEventHandler):
     """
     Custom event handler for watching CSV files.
-
-    This handler is triggered when new files are created in the input directory.
-    It processes only .csv files and ignores other file types.
+    Adds detected CSV files to a queue for sequential processing.
     """
 
     def __init__(self):
-        """Initialize the event handler with a set to track processed files."""
         super().__init__()
-        self.processed_files = set()  # Track files to prevent duplicate processing
+        self.queued_files = set()
 
     def on_created(self, event):
-        """
-        Handle file creation events.
-
-        Args:
-            event: The file system event object.
-        """
-        # Ignore directory creation events
+        """Handle file creation events - adds files to the processing queue."""
         if event.is_directory:
             return
 
         file_path = event.src_path
         file_name = os.path.basename(file_path)
 
-        # Only process CSV files
         if not file_name.lower().endswith(WATCH_EXTENSION):
-            logger.debug(f"Ignoring non-CSV file: {file_name}")
             return
 
-        # Prevent duplicate processing
-        if file_path in self.processed_files:
-            logger.debug(f"File already processed, skipping: {file_name}")
+        if file_path in self.queued_files:
             return
 
         logger.info(f"CSV file detected: {file_name}")
 
-        # Wait for file to be completely written
-        # This prevents reading partially written files
         time.sleep(FILE_STABILITY_DELAY)
 
-        # Double-check file still exists (might have been moved/deleted)
         if not os.path.exists(file_path):
             logger.warning(f"File no longer exists: {file_name}")
             return
 
-        # Mark as being processed
-        self.processed_files.add(file_path)
+        self.queued_files.add(file_path)
+        file_queue.put(file_path)
 
-        try:
-            # Process the CSV file
-            success = process_csv_file(file_path)
-
-            if success:
-                # Move to processed directory
-                move_to_processed(file_path)
-            else:
-                logger.error(f"Processing failed for: {file_name}")
-                # Remove from processed set so it can be retried
-                self.processed_files.discard(file_path)
-
-        except Exception as e:
-            logger.error(f"Unexpected error processing {file_name}: {str(e)}")
-            self.processed_files.discard(file_path)
+        queue_size = file_queue.qsize()
+        logger.info(f"Added to queue: {file_name} (queue size: {queue_size})")
 
 
 # =============================================================================
@@ -533,20 +466,11 @@ class CSVEventHandler(FileSystemEventHandler):
 def start_file_watcher():
     """
     Start the file watching service with queue-based processing.
-
-    This function:
-    1. Starts a queue processor thread that handles files one by one
-    2. Initializes the watchdog observer to monitor input_csv/
-    3. Runs continuously until interrupted (Ctrl+C)
-
     Files are processed in FIFO order (First In, First Out).
     """
     global queue_processor_running
 
-    # Ensure all required directories exist
     ensure_directories_exist()
-
-    # Load serial counter
     load_serial_counter()
 
     logger.info("=" * 60)
@@ -564,49 +488,31 @@ def start_file_watcher():
     queue_processor_running = True
     processor_thread = threading.Thread(target=queue_processor, daemon=True)
     processor_thread.start()
-    logger.info("Queue processor thread started.")
 
     # Create event handler and observer
     event_handler = CSVEventHandler()
     observer = Observer()
-
-    # Schedule the observer to watch the input directory
     observer.schedule(event_handler, INPUT_CSV_DIR, recursive=False)
-
-    # Start the observer
     observer.start()
+
     logger.info("File watcher started. Waiting for CSV files...")
     logger.info("-" * 60)
 
     try:
-        # Keep the service running
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Shutdown signal received. Stopping ingestion service...")
-
-        # Stop the queue processor
         queue_processor_running = False
-
-        # Stop the observer
         observer.stop()
 
-    # Wait for observer thread to finish
     observer.join()
-
-    # Wait for queue processor to finish
     processor_thread.join(timeout=5.0)
-
     logger.info("Ingestion service stopped.")
 
 
 def process_existing_files():
-    """
-    Process any existing CSV files in the input directory.
-
-    This function adds existing files to the queue for processing.
-    Files are processed in alphabetical order.
-    """
+    """Process any existing CSV files in the input directory by adding them to the queue."""
     ensure_directories_exist()
     load_serial_counter()
 
@@ -631,7 +537,6 @@ def process_existing_files():
     logger.info(f"All {len(existing_files)} existing files added to queue.")
 
 
-
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
@@ -646,15 +551,13 @@ if __name__ == "__main__":
     The service will:
     1. Process any existing CSV files in input_csv/
     2. Start monitoring for new CSV files
-    3. For each CSV:
+    3. For each CSV (processed one by one from queue):
        - Assign unique serial numbers to each row
        - Send rows (minus ignored columns) to isolation model
        - Output results to benign_results.csv or malicious_results.csv
+       - Show LIVE progress updates
        - Move processed CSV to processed_csv/
     4. Continue running until interrupted (Ctrl+C)
     """
-    # First, process any existing files
     process_existing_files()
-
-    # Then start watching for new files
     start_file_watcher()
