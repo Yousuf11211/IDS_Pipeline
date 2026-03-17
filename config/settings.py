@@ -127,6 +127,6 @@ CHUNK_SIZE = 100
 # =============================================================================
 
 # Whether to move processed CSV files to the processed_csv folder
-# Set to False during testing/development when processing partial CSVs
-MOVE_PROCESSED_FILES = False
+# Set to True for production behavior
+MOVE_PROCESSED_FILES = True
 

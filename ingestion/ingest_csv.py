@@ -258,6 +258,31 @@ def predict_with_random_forest(model, features, label_mapping):
 
 
 # =============================================================================
+# RESULTS SAVING
+# =============================================================================
+
+def save_results_to_csv(data_list, output_file):
+    """
+    Append processed results to the specified output CSV file.
+    Creates the file with header if it doesn't exist.
+    """
+    if not data_list:
+        return
+
+    try:
+        df = pd.DataFrame(data_list)
+        
+        # Check if file exists to determine if we need to write header
+        file_exists = os.path.exists(output_file)
+        
+        # Append mode 'a', include header only if file is new
+        df.to_csv(output_file, mode='a', header=not file_exists, index=False)
+        logger.info(f"Appended {len(data_list)} rows to: {output_file}")
+    except Exception as e:
+        logger.error(f"Failed to save results to {output_file}: {str(e)}")
+
+
+# =============================================================================
 # CSV VALIDATION
 # =============================================================================
 
@@ -333,42 +358,66 @@ def process_csv_file(file_path):
     benign_count = 0
     attack_counts = {}
 
+    # Lists to accumulate results for batch writing
+    benign_rows = []
+    malicious_rows = []
+
     # Process only TEST_ROW_LIMIT rows for testing
     rows_processed = 0
 
-    for chunk in pd.read_csv(file_path, chunksize=CHUNK_SIZE):
-        for index, row in chunk.iterrows():
+    with pd.read_csv(file_path, chunksize=CHUNK_SIZE) as reader:
+        for chunk in reader:
+            for index, row in chunk.iterrows():
+                if TEST_ROW_LIMIT is not None and rows_processed >= TEST_ROW_LIMIT:
+                    break
+
+                serial_number += 1
+                row_dict = row.to_dict()
+
+                # Get features (excluding ignored columns)
+                features = get_model_features(row_dict, columns)
+
+                # Stage 1: Isolation Model
+                isolation_result = predict_with_isolation_model(isolation_model, features)
+
+                if isolation_result == NORMAL_LABEL:
+                    # Benign - no need for stage 2
+                    stage1_label = "BENIGN"
+                    stage2_label = "N/A"
+                    benign_count += 1
+                    
+                    # Add labels to row for results
+                    row_dict['classification_stage1'] = stage1_label
+                    row_dict['classification_stage2'] = stage2_label
+                    row_dict['processed_timestamp'] = datetime.now().isoformat()
+                    benign_rows.append(row_dict)
+                else:
+                    # Not benign - send to random forest for attack classification
+                    stage1_label = "NOT BENIGN"
+                    _, attack_name = predict_with_random_forest(rf_model, features, label_mapping)
+                    stage2_label = attack_name
+                    attack_counts[attack_name] = attack_counts.get(attack_name, 0) + 1
+                    
+                    # Add labels to row for results
+                    row_dict['classification_stage1'] = stage1_label
+                    row_dict['classification_stage2'] = stage2_label
+                    row_dict['processed_timestamp'] = datetime.now().isoformat()
+                    malicious_rows.append(row_dict)
+
+                # Print result to console
+                print(f"{rows_processed + 1:<8} {serial_number:<10} {stage1_label:<25} {stage2_label:<30}")
+
+                rows_processed += 1
+
             if TEST_ROW_LIMIT is not None and rows_processed >= TEST_ROW_LIMIT:
                 break
 
-            serial_number += 1
-            row_dict = row.to_dict()
-
-            # Get features (excluding ignored columns)
-            features = get_model_features(row_dict, columns)
-
-            # Stage 1: Isolation Model
-            isolation_result = predict_with_isolation_model(isolation_model, features)
-
-            if isolation_result == NORMAL_LABEL:
-                # Benign - no need for stage 2
-                stage1_label = "BENIGN"
-                stage2_label = "N/A"
-                benign_count += 1
-            else:
-                # Not benign - send to random forest for attack classification
-                stage1_label = "NOT BENIGN"
-                _, attack_name = predict_with_random_forest(rf_model, features, label_mapping)
-                stage2_label = attack_name
-                attack_counts[attack_name] = attack_counts.get(attack_name, 0) + 1
-
-            # Print result to console
-            print(f"{rows_processed + 1:<8} {serial_number:<10} {stage1_label:<25} {stage2_label:<30}")
-
-            rows_processed += 1
-
-        if TEST_ROW_LIMIT is not None and rows_processed >= TEST_ROW_LIMIT:
-            break
+    # Save accumulated results to CSV files
+    if benign_rows:
+        save_results_to_csv(benign_rows, BENIGN_RESULTS_FILE)
+    
+    if malicious_rows:
+        save_results_to_csv(malicious_rows, MALICIOUS_RESULTS_FILE)
 
     print("-" * 80)
     print("\nSUMMARY:")
