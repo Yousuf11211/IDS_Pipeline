@@ -58,12 +58,21 @@ FILE_STABILITY_DELAY = 1.0
 WATCH_EXTENSION = ".csv"
 
 # =============================================================================
-# ISOLATION MODEL CONFIGURATION
+# ISOLATION MODEL CONFIGURATION (First Model - Benign Detection)
 # =============================================================================
 
 # Folder for isolation model
 ISOLATION_MODEL_DIR = os.path.join(BASE_DIR, "isolation_model")
 ISOLATION_MODEL_FILE = os.path.join(ISOLATION_MODEL_DIR, "isolation.joblib")
+
+# =============================================================================
+# RANDOM FOREST MODEL CONFIGURATION (Second Model - Attack Classification)
+# =============================================================================
+
+# Folder for random forest model
+RANDOM_FOREST_DIR = os.path.join(BASE_DIR, "random_forest")
+RANDOM_FOREST_MODEL_FILE = os.path.join(RANDOM_FOREST_DIR, "Attacks_part_1_inf_handled_rf_model.joblib")
+LABEL_MAPPING_FILE = os.path.join(RANDOM_FOREST_DIR, "Attacks_part_1_inf_handled_label_mapping.txt")
 
 # =============================================================================
 # RESULTS CONFIGURATION
@@ -77,7 +86,7 @@ MALICIOUS_RESULTS_FILE = os.path.join(RESULTS_DIR, "malicious_results.csv")
 # =============================================================================
 # COLUMNS TO IGNORE FOR MODEL PREDICTION
 # =============================================================================
-# List of column names to exclude when sending data to the isolation model
+# List of column names to exclude when sending data to the models
 # These columns will still appear in the final results CSV
 # Add column names here that should not be used for anomaly detection
 
@@ -98,10 +107,26 @@ ANOMALY_LABEL = -1
 NORMAL_LABEL = 1
 
 # =============================================================================
-# CHUNKED PROCESSING CONFIGURATION
+# QUEUE AND BATCH CONFIGURATION
 # =============================================================================
 
-# Number of rows to load into memory at a time
-# This prevents memory issues with large CSV files
-CHUNK_SIZE = 1000
+# Batch size for processing rows through the first model (isolation)
+ISOLATION_BATCH_SIZE = 100
+
+# Queue size limit for rows waiting to be processed
+ROW_QUEUE_MAX_SIZE = 1000
+
+# For testing: limit number of rows to process (set to None for no limit)
+TEST_ROW_LIMIT = 10
+
+# Chunk size for reading CSV files
+CHUNK_SIZE = 100
+
+# =============================================================================
+# FILE HANDLING CONFIGURATION
+# =============================================================================
+
+# Whether to move processed CSV files to the processed_csv folder
+# Set to False during testing/development when processing partial CSVs
+MOVE_PROCESSED_FILES = False
 

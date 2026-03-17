@@ -1,18 +1,20 @@
 """
-CSV Ingestion Service for IDS/NIDS Pipeline.
+CSV Ingestion Service for IDS/NIDS Pipeline with Two-Stage Classification.
 
-This module implements a file-watching service that automatically detects
-new CSV files in the input directory, processes them row by row through
-an isolation model for anomaly detection, and outputs results to separate
-CSV files for benign and malicious traffic.
+This module implements a file-watching service with a two-stage ML pipeline:
+1. Isolation Model: Detects if traffic is benign or potentially malicious
+2. Random Forest Model: Classifies the specific attack type for malicious traffic
 
 Flow:
 1. Watch input_csv/ folder for new CSV files
-2. Add detected CSVs to a processing queue (FIFO)
-3. Process each CSV one by one from the queue
-4. For each row: assign serial number, send to isolation model
-5. Append result to benign_results.csv or malicious_results.csv (LIVE updates)
-6. Move processed CSV to processed_csv/ folder
+2. Add detected CSVs to a file queue (FIFO)
+3. For each CSV:
+   - Add rows to a row queue (batch of ISOLATION_BATCH_SIZE rows)
+   - First model (Isolation): Classify as benign or not benign
+   - If benign: Print result to console
+   - If not benign: Send to second model (Random Forest) for attack classification
+   - Print all results to console
+4. Move processed CSV to processed_csv/ folder
 """
 
 import os
@@ -44,13 +46,20 @@ from config.settings import (
     WATCH_EXTENSION,
     ISOLATION_MODEL_DIR,
     ISOLATION_MODEL_FILE,
+    RANDOM_FOREST_DIR,
+    RANDOM_FOREST_MODEL_FILE,
+    LABEL_MAPPING_FILE,
     RESULTS_DIR,
     BENIGN_RESULTS_FILE,
     MALICIOUS_RESULTS_FILE,
     COLUMNS_TO_IGNORE,
     ANOMALY_LABEL,
     NORMAL_LABEL,
-    CHUNK_SIZE
+    ISOLATION_BATCH_SIZE,
+    ROW_QUEUE_MAX_SIZE,
+    TEST_ROW_LIMIT,
+    CHUNK_SIZE,
+    MOVE_PROCESSED_FILES
 )
 
 
@@ -88,10 +97,12 @@ def setup_logging():
 # Initialize logger
 logger = setup_logging()
 
-# Global queue for CSV files to be processed (FIFO - First In, First Out)
-file_queue = Queue()
+# Global queues
+file_queue = Queue()  # Queue for CSV files to be processed
+row_queue = Queue(maxsize=ROW_QUEUE_MAX_SIZE)  # Queue for rows to be processed by isolation model
+attack_queue = Queue()  # Queue for rows to be classified by random forest
 
-# Flag to control the queue processor thread
+# Flag to control the queue processor threads
 queue_processor_running = True
 
 
@@ -106,6 +117,7 @@ def ensure_directories_exist():
         PROCESSED_CSV_DIR,
         LOGS_DIR,
         ISOLATION_MODEL_DIR,
+        RANDOM_FOREST_DIR,
         RESULTS_DIR
     ]
 
@@ -116,10 +128,12 @@ def ensure_directories_exist():
 
 
 # =============================================================================
-# ISOLATION MODEL LOADER
+# MODEL LOADERS
 # =============================================================================
 
 _isolation_model = None
+_random_forest_model = None
+_label_mapping = None
 
 
 def load_isolation_model():
@@ -143,103 +157,112 @@ def load_isolation_model():
         return None
 
 
-def predict_anomaly(model, row_data):
-    """Use the isolation model to predict if a row is anomaly or normal."""
+def load_random_forest_model():
+    """Load the random forest model and label mapping."""
+    global _random_forest_model, _label_mapping
+
+    if _random_forest_model is not None:
+        return _random_forest_model, _label_mapping
+
+    if not os.path.exists(RANDOM_FOREST_MODEL_FILE):
+        logger.error(f"Random forest model not found at: {RANDOM_FOREST_MODEL_FILE}")
+        logger.error("Please place your trained RF model in the random_forest/ folder")
+        return None, None
+
     try:
-        features = np.array(row_data).reshape(1, -1)
-        prediction = model.predict(features)
+        _random_forest_model = joblib.load(RANDOM_FOREST_MODEL_FILE)
+        logger.info(f"Random forest model loaded successfully from: {RANDOM_FOREST_MODEL_FILE}")
+
+        # Load label mapping
+        _label_mapping = load_label_mapping()
+
+        return _random_forest_model, _label_mapping
+    except Exception as e:
+        logger.error(f"Failed to load random forest model: {str(e)}")
+        return None, None
+
+
+def load_label_mapping():
+    """Load the attack label mapping from the text file."""
+    mapping = {}
+
+    if not os.path.exists(LABEL_MAPPING_FILE):
+        logger.warning(f"Label mapping file not found at: {LABEL_MAPPING_FILE}")
+        return mapping
+
+    try:
+        with open(LABEL_MAPPING_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if ':' in line and not line.startswith('='):
+                    parts = line.split(':')
+                    if len(parts) == 2:
+                        label_name = parts[0].strip()
+                        label_value = parts[1].strip()
+                        try:
+                            mapping[int(label_value)] = label_name
+                        except ValueError:
+                            continue
+        logger.info(f"Loaded {len(mapping)} attack labels from mapping file")
+        return mapping
+    except Exception as e:
+        logger.error(f"Failed to load label mapping: {str(e)}")
+        return mapping
+
+
+# =============================================================================
+# PREDICTION FUNCTIONS
+# =============================================================================
+
+def get_model_features(row_dict, columns):
+    """Extract features for the model, excluding ignored columns."""
+    features = []
+    for col in columns:
+        if col not in COLUMNS_TO_IGNORE:
+            value = row_dict.get(col, 0)
+            try:
+                features.append(float(value))
+            except (ValueError, TypeError):
+                features.append(0)
+    return features
+
+
+def predict_with_isolation_model(model, features):
+    """
+    Use the isolation model to predict if a row is benign or potentially malicious.
+    Returns: 1 for benign, -1 for anomaly/potentially malicious
+    """
+    try:
+        features_array = np.array(features).reshape(1, -1)
+        prediction = model.predict(features_array)
         return prediction[0]
     except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
-        return ANOMALY_LABEL
+        logger.error(f"Isolation model prediction error: {str(e)}")
+        return ANOMALY_LABEL  # Default to anomaly on error
 
 
-# =============================================================================
-# RESULTS FILE HANDLING
-# =============================================================================
-
-def initialize_results_files(columns):
-    """Initialize the results CSV files with headers if they don't exist."""
-    header_columns = ['serial_number'] + columns + ['label']
-
-    for results_file, label in [(BENIGN_RESULTS_FILE, 'benign'), (MALICIOUS_RESULTS_FILE, 'malicious')]:
-        if not os.path.exists(results_file):
-            df_header = pd.DataFrame(columns=header_columns)
-            df_header.to_csv(results_file, index=False)
-            logger.info(f"Created {label} results file: {results_file}")
-
-
-def append_to_results(row_data, label, serial_number, columns):
+def predict_with_random_forest(model, features, label_mapping):
     """
-    Append a row to the appropriate results CSV file.
-    Writes immediately (no buffering) for live updates.
+    Use the random forest model to classify the specific attack type.
+    Returns: (predicted_class_index, attack_name)
     """
-    if label == 'benign':
-        results_file = BENIGN_RESULTS_FILE
-    else:
-        results_file = MALICIOUS_RESULTS_FILE
-
-    output_row = {'serial_number': serial_number}
-    for col in columns:
-        output_row[col] = row_data.get(col, '')
-    output_row['label'] = label
-
-    df_row = pd.DataFrame([output_row])
-    file_exists = os.path.exists(results_file) and os.path.getsize(results_file) > 0
-
-    # Write with flush for immediate live update
-    with open(results_file, 'a', newline='', encoding='utf-8') as f:
-        df_row.to_csv(f, header=not file_exists, index=False)
-        f.flush()
-
-
-# =============================================================================
-# SERIAL NUMBER GENERATOR
-# =============================================================================
-
-_serial_counter = 0
-SERIAL_COUNTER_FILE = os.path.join(LOGS_DIR, ".serial_counter")
-
-
-def load_serial_counter():
-    """Load the serial counter from file or initialize to 0."""
-    global _serial_counter
-
-    if os.path.exists(SERIAL_COUNTER_FILE):
-        try:
-            with open(SERIAL_COUNTER_FILE, 'r') as f:
-                _serial_counter = int(f.read().strip())
-                logger.info(f"Loaded serial counter: {_serial_counter}")
-        except Exception:
-            _serial_counter = 0
-    else:
-        _serial_counter = 0
-
-
-def save_serial_counter():
-    """Save the current serial counter to file."""
-    global _serial_counter
     try:
-        with open(SERIAL_COUNTER_FILE, 'w') as f:
-            f.write(str(_serial_counter))
+        features_array = np.array(features).reshape(1, -1)
+        prediction = model.predict(features_array)
+        predicted_class = int(prediction[0])
+        attack_name = label_mapping.get(predicted_class, f"Unknown_Attack_{predicted_class}")
+        return predicted_class, attack_name
     except Exception as e:
-        logger.error(f"Failed to save serial counter: {str(e)}")
-
-
-def get_next_serial_number():
-    """Get the next unique serial number."""
-    global _serial_counter
-    _serial_counter += 1
-    save_serial_counter()
-    return _serial_counter
+        logger.error(f"Random forest prediction error: {str(e)}")
+        return -1, "Prediction_Error"
 
 
 # =============================================================================
-# CSV VALIDATION AND PROCESSING
+# CSV VALIDATION
 # =============================================================================
 
 def validate_csv_file(file_path):
-    """Validate that a CSV file is readable and not empty (without loading entire file)."""
+    """Validate that a CSV file is readable and not empty."""
     try:
         if not os.path.exists(file_path):
             return False, None, "File does not exist"
@@ -247,13 +270,12 @@ def validate_csv_file(file_path):
         if os.path.getsize(file_path) == 0:
             return False, None, "File is empty (0 bytes)"
 
-        # Only read first few rows to validate and get columns
+        # Read first few rows to validate and get columns
         df_sample = pd.read_csv(file_path, nrows=5)
 
         if df_sample.empty:
             return False, None, "CSV file has no data rows"
 
-        # Return column names instead of full dataframe
         return True, list(df_sample.columns), None
 
     except pd.errors.EmptyDataError:
@@ -264,101 +286,106 @@ def validate_csv_file(file_path):
         return False, None, f"Unexpected error reading CSV: {str(e)}"
 
 
-def count_csv_rows(file_path):
-    """Count total rows in CSV without loading into memory."""
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            # Subtract 1 for header row
-            return sum(1 for _ in f) - 1
-    except Exception:
-        return 0
-
-
-def get_model_features(row, columns):
-    """Extract features for the model, excluding ignored columns."""
-    features = []
-    for col in columns:
-        if col not in COLUMNS_TO_IGNORE:
-            value = row[col]
-            try:
-                features.append(float(value))
-            except (ValueError, TypeError):
-                features.append(0)
-    return features
-
+# =============================================================================
+# MAIN PROCESSING FUNCTION
+# =============================================================================
 
 def process_csv_file(file_path):
     """
-    Process a CSV file in chunks through the isolation model.
-    Only loads CHUNK_SIZE rows into memory at a time.
-    Shows LIVE progress updates for each row processed.
+    Process a CSV file through the two-stage classification pipeline.
+
+    Stage 1: Isolation Model - Benign vs Not Benign
+    Stage 2: Random Forest - Attack Classification (only for not benign)
+
+    For testing, only processes TEST_ROW_LIMIT rows.
     """
     file_name = os.path.basename(file_path)
     logger.info(f"Starting processing of CSV file: {file_name}")
 
+    # Validate CSV
     is_valid, columns, error_message = validate_csv_file(file_path)
-
     if not is_valid:
         logger.error(f"Validation failed for {file_name}: {error_message}")
         return False
 
-    # Count total rows without loading entire file
-    row_count = count_csv_rows(file_path)
-    column_count = len(columns)
-
     logger.info(f"CSV validated successfully: {file_name}")
-    logger.info(f"Rows detected: {row_count}")
-    logger.info(f"Columns detected: {column_count}")
-    logger.info(f"Column names: {columns}")
+    logger.info(f"Columns detected: {len(columns)}")
     logger.info(f"Columns to ignore for model: {COLUMNS_TO_IGNORE}")
-    logger.info(f"Processing in chunks of {CHUNK_SIZE} rows (memory efficient)")
 
-    model = load_isolation_model()
-    if model is None:
-        logger.error("Cannot process without isolation model. Please add model to isolation_model/ folder.")
+    # Load models
+    isolation_model = load_isolation_model()
+    if isolation_model is None:
+        logger.error("Cannot process without isolation model")
         return False
 
-    initialize_results_files(columns)
+    rf_model, label_mapping = load_random_forest_model()
+    if rf_model is None:
+        logger.error("Cannot process without random forest model")
+        return False
 
+    print("\n" + "=" * 80)
+    print("TWO-STAGE CLASSIFICATION PIPELINE - RESULTS")
+    print("=" * 80)
+    print(f"{'Row #':<8} {'Serial #':<10} {'Stage 1 (Isolation)':<25} {'Stage 2 (Attack Type)':<30}")
+    print("-" * 80)
+
+    serial_number = 0
     benign_count = 0
-    malicious_count = 0
-    processed_rows = 0
+    attack_counts = {}
 
-    logger.info(f"Processing {row_count} rows through isolation model...")
-    print()  # Empty line for cleaner output
+    # Process only TEST_ROW_LIMIT rows for testing
+    rows_processed = 0
 
-    # Process CSV in chunks - only CHUNK_SIZE rows in memory at a time
     for chunk in pd.read_csv(file_path, chunksize=CHUNK_SIZE):
         for index, row in chunk.iterrows():
-            serial_number = get_next_serial_number()
-            features = get_model_features(row, columns)
-            prediction = predict_anomaly(model, features)
+            if TEST_ROW_LIMIT is not None and rows_processed >= TEST_ROW_LIMIT:
+                break
+
+            serial_number += 1
             row_dict = row.to_dict()
 
-            if prediction == NORMAL_LABEL:
-                label = 'benign'
+            # Get features (excluding ignored columns)
+            features = get_model_features(row_dict, columns)
+
+            # Stage 1: Isolation Model
+            isolation_result = predict_with_isolation_model(isolation_model, features)
+
+            if isolation_result == NORMAL_LABEL:
+                # Benign - no need for stage 2
+                stage1_label = "BENIGN"
+                stage2_label = "N/A"
                 benign_count += 1
             else:
-                label = 'malicious'
-                malicious_count += 1
+                # Not benign - send to random forest for attack classification
+                stage1_label = "NOT BENIGN"
+                _, attack_name = predict_with_random_forest(rf_model, features, label_mapping)
+                stage2_label = attack_name
+                attack_counts[attack_name] = attack_counts.get(attack_name, 0) + 1
 
-            append_to_results(row_dict, label, serial_number, columns)
-            processed_rows += 1
+            # Print result to console
+            print(f"{rows_processed + 1:<8} {serial_number:<10} {stage1_label:<25} {stage2_label:<30}")
 
-            # LIVE progress update - overwrites same line for real-time feedback
-            progress = (processed_rows / row_count) * 100 if row_count > 0 else 100
-            sys.stdout.write(f"\r[LIVE] Row {processed_rows}/{row_count} ({progress:.1f}%) | Serial: {serial_number} | Result: {label.upper():10} | Benign: {benign_count} | Malicious: {malicious_count}")
-            sys.stdout.flush()
+            rows_processed += 1
 
-    print()  # New line after progress complete
+        if TEST_ROW_LIMIT is not None and rows_processed >= TEST_ROW_LIMIT:
+            break
+
+    print("-" * 80)
+    print("\nSUMMARY:")
+    print(f"  Total rows processed: {rows_processed}")
+    print(f"  Benign traffic: {benign_count}")
+    print(f"  Potentially malicious: {rows_processed - benign_count}")
+
+    if attack_counts:
+        print("\n  Attack Type Breakdown:")
+        for attack, count in sorted(attack_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"    - {attack}: {count}")
+
+    print("=" * 80 + "\n")
 
     logger.info(f"Processing complete for {file_name}")
-    logger.info(f"Total rows processed: {processed_rows}")
-    logger.info(f"Benign (normal) rows: {benign_count}")
-    logger.info(f"Malicious (anomaly) rows: {malicious_count}")
-    logger.info(f"Results saved to:")
-    logger.info(f"  - Benign: {BENIGN_RESULTS_FILE}")
-    logger.info(f"  - Malicious: {MALICIOUS_RESULTS_FILE}")
+    logger.info(f"Total rows processed: {rows_processed}")
+    logger.info(f"Benign: {benign_count}, Potentially malicious: {rows_processed - benign_count}")
 
     return True
 
@@ -386,17 +413,16 @@ def move_to_processed(file_path):
 
 
 # =============================================================================
-# QUEUE PROCESSOR
+# FILE QUEUE PROCESSOR
 # =============================================================================
 
-def queue_processor():
+def file_queue_processor():
     """
-    Worker thread that processes files from the queue one by one.
-    Ensures files are processed sequentially in FIFO order.
+    Worker thread that processes files from the file queue one by one.
     """
     global queue_processor_running
 
-    logger.info("Queue processor started - waiting for files...")
+    logger.info("File queue processor started - waiting for files...")
 
     while queue_processor_running:
         try:
@@ -419,7 +445,10 @@ def queue_processor():
                 success = process_csv_file(file_path)
 
                 if success:
-                    move_to_processed(file_path)
+                    if MOVE_PROCESSED_FILES:
+                        move_to_processed(file_path)
+                    else:
+                        logger.info(f"File moving disabled. File remains in input_csv/: {file_name}")
                 else:
                     logger.error(f"Processing failed for: {file_name}")
 
@@ -429,9 +458,9 @@ def queue_processor():
             file_queue.task_done()
 
         except Exception as e:
-            logger.error(f"Queue processor error: {str(e)}")
+            logger.error(f"File queue processor error: {str(e)}")
 
-    logger.info("Queue processor stopped.")
+    logger.info("File queue processor stopped.")
 
 
 # =============================================================================
@@ -474,7 +503,7 @@ class CSVEventHandler(FileSystemEventHandler):
         file_queue.put(file_path)
 
         queue_size = file_queue.qsize()
-        logger.info(f"Added to queue: {file_name} (queue size: {queue_size})")
+        logger.info(f"Added to file queue: {file_name} (queue size: {queue_size})")
 
 
 # =============================================================================
@@ -484,27 +513,26 @@ class CSVEventHandler(FileSystemEventHandler):
 def start_file_watcher():
     """
     Start the file watching service with queue-based processing.
-    Files are processed in FIFO order (First In, First Out).
     """
     global queue_processor_running
 
     ensure_directories_exist()
-    load_serial_counter()
 
     logger.info("=" * 60)
-    logger.info("IDS/NIDS Pipeline - CSV Ingestion Service Starting")
+    logger.info("IDS/NIDS Pipeline - Two-Stage Classification Service Starting")
     logger.info("=" * 60)
     logger.info(f"Monitoring directory: {INPUT_CSV_DIR}")
-    logger.info(f"Processed files will be moved to: {PROCESSED_CSV_DIR}")
-    logger.info(f"Isolation model location: {ISOLATION_MODEL_FILE}")
-    logger.info(f"Results directory: {RESULTS_DIR}")
+    logger.info(f"Processed files directory: {PROCESSED_CSV_DIR}")
+    logger.info(f"Move files after processing: {MOVE_PROCESSED_FILES}")
+    logger.info(f"Stage 1 Model (Isolation): {ISOLATION_MODEL_FILE}")
+    logger.info(f"Stage 2 Model (Random Forest): {RANDOM_FOREST_MODEL_FILE}")
     logger.info(f"Columns to ignore: {COLUMNS_TO_IGNORE}")
-    logger.info("Queue-based processing: Files processed one at a time (FIFO)")
+    logger.info(f"Test mode: Processing only {TEST_ROW_LIMIT} rows per file")
     logger.info("-" * 60)
 
-    # Start the queue processor thread
+    # Start the file queue processor thread
     queue_processor_running = True
-    processor_thread = threading.Thread(target=queue_processor, daemon=True)
+    processor_thread = threading.Thread(target=file_queue_processor, daemon=True)
     processor_thread.start()
 
     # Create event handler and observer
@@ -530,9 +558,8 @@ def start_file_watcher():
 
 
 def process_existing_files():
-    """Process any existing CSV files in the input directory by adding them to the queue."""
+    """Process any existing CSV files in the input directory."""
     ensure_directories_exist()
-    load_serial_counter()
 
     logger.info("Checking for existing CSV files in input directory...")
 
@@ -561,7 +588,7 @@ def process_existing_files():
 
 if __name__ == "__main__":
     """
-    Main entry point for the ingestion service.
+    Main entry point for the two-stage classification ingestion service.
     
     Usage:
         python ingest_csv.py
@@ -569,13 +596,15 @@ if __name__ == "__main__":
     The service will:
     1. Process any existing CSV files in input_csv/
     2. Start monitoring for new CSV files
-    3. For each CSV (processed one by one from queue):
-       - Assign unique serial numbers to each row
-       - Send rows (minus ignored columns) to isolation model
-       - Output results to benign_results.csv or malicious_results.csv
-       - Show LIVE progress updates
+    3. For each CSV:
+       - Stage 1: Send rows to Isolation Model (benign detection)
+       - Stage 2: For non-benign rows, send to Random Forest (attack classification)
+       - Print all results to console
        - Move processed CSV to processed_csv/
     4. Continue running until interrupted (Ctrl+C)
+    
+    Test Mode: Currently processes only 10 rows per file for testing.
+    Change TEST_ROW_LIMIT in settings.py to None for full processing.
     """
     process_existing_files()
     start_file_watcher()
