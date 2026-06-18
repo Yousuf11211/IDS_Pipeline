@@ -1,0 +1,15 @@
+Label Encoding Mapping
+========================================
+Bot                           : 0
+Brute_Force_FTP               : 1
+Brute_Force_SSH               : 2
+Brute_Force_Web               : 3
+Brute_Force_XSS               : 4
+DDoS_HOIC                     : 5
+DDoS_LOIC_HTTP                : 6
+DoS_Golden_Eye                : 7
+DoS_HULK                      : 8
+DoS_SlowHTTP                  : 9
+DoS_Slowloris                 : 10
+Infiltration                  : 11
+SQL_Injection                 : 12

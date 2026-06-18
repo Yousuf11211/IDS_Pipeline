@@ -130,3 +130,24 @@ CHUNK_SIZE = 100
 # Set to True for production behavior
 MOVE_PROCESSED_FILES = True
 
+# =============================================================================
+# PIPELINE MODE + CHUNK PROCESSING CONFIGURATION (DUAL FLOW)
+# =============================================================================
+
+# Switch between:
+# - "RAW_DB_FLOW": CSV -> raw_data DB -> anomaly model -> split to normal/anomalies DB
+# - "ANOMALY_TEST_FLOW": CSV -> anomaly model -> multi-class model -> console output
+PIPELINE_MODE = "ANOMALY_TEST_FLOW"
+
+# Input folder containing CSV files for pipeline processing
+INPUT_FOLDER = INPUT_CSV_DIR
+
+# If True, process all rows in each CSV.
+# If False, process only MAX_ROWS_PER_FILE rows per CSV.
+PROCESS_ALL_FILES = True
+MAX_ROWS_PER_FILE = 100000
+
+# Database table names used by RAW_DB_FLOW
+RAW_DATA_TABLE = "raw_data"
+NORMAL_TRAFFIC_TABLE = "normal_traffic"
+ANOMALIES_TABLE = "anomalies"
